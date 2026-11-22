@@ -1,0 +1,42 @@
+name: ecoride
+description: EcoRide - a carpooling app with fair, equally shared fares (Flutter + Firebase).
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.6.0 <4.0.0"
+  flutter: ">=3.27.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Firebase
+  firebase_core: ">=3.6.0"
+  firebase_auth: ">=5.3.1"
+  cloud_firestore: ">=5.4.4"
+  firebase_storage: ">=12.3.4"
+
+  # State management & navigation
+  flutter_riverpod: ^2.6.1
+  go_router: ">=14.2.0"
+
+  # Maps, location, routing (OpenStreetMap - no API key needed)
+  flutter_map: ">=7.0.2 <9.0.0"
+  latlong2: ^0.9.1
+  geolocator: ">=13.0.1 <15.0.0"
+  http: ^1.2.2
+
+  # Utilities
+  intl: ">=0.19.0"
+  file_picker: 10.3.6
+  url_launcher: ^6.3.1
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true

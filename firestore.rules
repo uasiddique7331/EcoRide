@@ -1,0 +1,151 @@
+rules_version = '2';
+
+// EcoRide Firestore security rules.
+// Roles: driver | passenger | admin (admin accounts are created manually, see README).
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function userDoc(uid) { return get(/databases/$(database)/documents/users/$(uid)); }
+    function me() { return userDoc(request.auth.uid).data; }
+    function isAdmin() { return signedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) && me().role == 'admin'; }
+    function isActive() { return me().status == 'active'; }
+    function isVerified() { return me().isVerified == true; }
+    function changedOnly(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
+
+    // ---- users --------------------------------------------------------------
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      // Self-registration: only driver/passenger, never verified, always active.
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.role in ['driver', 'passenger']
+        && request.resource.data.status == 'active'
+        && request.resource.data.isVerified == false;
+      // Owners may edit only name and phone.
+      allow update: if signedIn() && (
+        (request.auth.uid == uid && changedOnly(['fullName', 'phone', 'updatedAt']))
+        || (isAdmin() && resource.data.role != 'admin' && changedOnly(['status', 'statusReason', 'isVerified', 'updatedAt']))
+      );
+      allow delete: if false;
+    }
+
+    // ---- vehicles (doc id == driver uid => one vehicle per driver) -------------
+    match /vehicles/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.ownerId == uid
+        && getAfter(/databases/$(database)/documents/users/$(uid)).data.role == 'driver'
+        && request.resource.data.capacity is int
+        && request.resource.data.capacity >= 1 && request.resource.data.capacity <= 8;
+      allow update: if signedIn() && request.auth.uid == uid && changedOnly(['color', 'type', 'capacity', 'updatedAt'])
+        && request.resource.data.capacity >= 1 && request.resource.data.capacity <= 8;
+      allow delete: if false;
+    }
+
+    // ---- documents (CNIC / vehicle registration metadata) ----------------------
+    match /documents/{docId} {
+      allow read: if signedIn() && (resource.data.ownerId == request.auth.uid || isAdmin());
+      allow create: if signedIn() && request.resource.data.ownerId == request.auth.uid
+        && docId.matches(request.auth.uid + '_.*')
+        && request.resource.data.status == 'pending';
+      // Owner may re-upload (status returns to pending); admin reviews.
+      allow update: if signedIn() && (
+        (resource.data.ownerId == request.auth.uid
+          && resource.data.status != 'approved'
+          && request.resource.data.status == 'pending'
+          && changedOnly(['storagePath', 'fileName', 'fileSize', 'mimeType', 'status', 'rejectionReason', 'uploadedAt']))
+        || (isAdmin() && changedOnly(['status', 'rejectionReason', 'reviewedBy', 'reviewedByName', 'reviewedAt']))
+      );
+      allow delete: if false;
+    }
+
+    // ---- trips --------------------------------------------------------------------
+    match /trips/{tripId} {
+      allow read: if signedIn() && (isAdmin() || isActive());
+
+      allow create: if signedIn() && isActive() && isVerified()
+        && me().role == 'driver'
+        && request.resource.data.driverId == request.auth.uid
+        && request.resource.data.status == 'scheduled'
+        && request.resource.data.acceptedPassengers == 0
+        && request.resource.data.availableSeats == request.resource.data.totalSeats
+        && request.resource.data.totalSeats >= 1
+        && request.resource.data.totalSeats <= get(/databases/$(database)/documents/vehicles/$(request.auth.uid)).data.capacity
+        && request.resource.data.farePerKm == 25;
+
+      allow update: if signedIn() && (
+        // Driver manages own trip; counters must stay within bounds.
+        (resource.data.driverId == request.auth.uid
+          && request.resource.data.driverId == resource.data.driverId
+          && request.resource.data.availableSeats >= 0
+          && request.resource.data.availableSeats <= request.resource.data.totalSeats
+          && request.resource.data.totalFare == resource.data.totalFare)
+        // Admin may cancel / correct status.
+        || (isAdmin() && changedOnly(['status', 'cancelReason', 'updatedAt']))
+        // Passenger releasing seats when cancelling THEIR accepted booking (same batch/transaction).
+        || (me().role == 'passenger' && passengerReleasingSeats(tripId))
+      );
+      allow delete: if false;
+    }
+
+    function passengerReleasingSeats(tripId) {
+      let bid = request.resource.data.lastBookingId;
+      let before = get(/databases/$(database)/documents/bookings/$(bid)).data;
+      let after = getAfter(/databases/$(database)/documents/bookings/$(bid)).data;
+      return before.tripId == tripId
+        && before.passengerId == request.auth.uid
+        && before.status == 'accepted'
+        && after.status == 'cancelled'
+        && request.resource.data.availableSeats == resource.data.availableSeats + before.seats
+        && request.resource.data.acceptedPassengers == resource.data.acceptedPassengers - before.seats
+        && changedOnly(['availableSeats', 'acceptedPassengers', 'lastBookingId', 'updatedAt']);
+    }
+
+    // ---- bookings (id == tripId_passengerId => no duplicates) ----------------------
+    match /bookings/{bookingId} {
+      allow read: if signedIn() && (
+        resource.data.passengerId == request.auth.uid
+        || resource.data.driverId == request.auth.uid
+        || isAdmin());
+
+      allow create: if validNewBooking(bookingId);
+
+      allow update: if signedIn() && (
+        // Driver of the trip: accept / reject / cancel with trip.
+        (resource.data.driverId == request.auth.uid
+          && request.resource.data.status in ['accepted', 'rejected', 'cancelled']
+          && changedOnly(['status', 'respondedAt', 'updatedAt', 'driverName', 'driverPhone', 'statusNote']))
+        // Passenger cancels own pending/accepted booking.
+        || (resource.data.passengerId == request.auth.uid
+          && resource.data.status in ['pending', 'accepted']
+          && request.resource.data.status == 'cancelled'
+          && changedOnly(['status', 'statusNote', 'updatedAt']))
+        // Passenger re-requests after a cancellation.
+        || (resource.data.passengerId == request.auth.uid
+          && resource.data.status == 'cancelled'
+          && validNewBooking(bookingId))
+        || isAdmin()
+      );
+      allow delete: if false;
+    }
+
+    function validNewBooking(bookingId) {
+      let d = request.resource.data;
+      let trip = get(/databases/$(database)/documents/trips/$(d.tripId)).data;
+      return signedIn() && isActive() && isVerified() && me().role == 'passenger'
+        && d.passengerId == request.auth.uid
+        && bookingId == d.tripId + '_' + request.auth.uid
+        && d.status == 'pending'
+        && d.seats is int && d.seats >= 1 && d.seats <= 4
+        && d.driverId == trip.driverId
+        && trip.status == 'scheduled'
+        && trip.availableSeats >= d.seats;
+    }
+
+    // ---- admin audit log ---------------------------------------------------------------
+    match /adminLogs/{id} {
+      allow read, create: if isAdmin();
+      allow update, delete: if false;
+    }
+  }
+}
